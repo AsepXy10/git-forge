@@ -1,9 +1,20 @@
-# github-core-clone-01 — git forge entry
+# git-forge
 
-A complete GitHub-compatible git forge for [the contest](https://make.fun/bounty/github-core-clone-01),
-built on the starter: a single-process Node 22 TypeScript server, stdlib only, no dependencies, no
-`git` binary, no outside service, no UI. All state lives in memory; server-created commits use fixed
-timestamps and counters, so two runs on the same instance leave the same state export byte-for-byte.
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/AsepXy10/git-forge/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/AsepXy10/git-forge/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
+A GitHub-compatible git forge: a single-process Node 22 TypeScript server, stdlib only, with git smart HTTP, REST v3, GraphQL, and MCP — built for [make.fun's "Build a GitHub-compatible git forge" bounty](https://make.fun/bounty/github-core-clone-01).
+
+## Run it
+
+```sh
+node --experimental-strip-types main.ts
+```
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
 
 ## What is implemented (in `app.ts`)
 
@@ -35,20 +46,11 @@ node cli/makefun.mjs grade-local --kit . --bot ~/workspace/makefun/git-forge-ent
 node --experimental-strip-types sdk/run.ts --url http://127.0.0.1:18080 --token test-token --perf
 ```
 
-Latest local results (2026-11-19): SDK runner **120/120 checks, 926/1000** (feature 600, agent 200,
-perf 126); sealed `grade-local` run pending in the report.
+Latest local results (2026-11-19): sealed `grade-local` **911/1000** mean (feature 600/600, agent
+200/200, perf 111/200) across 3 trials (911, 896, 926), replay matched byte-for-byte; after the
+entry-lifecycle rewrite, **922/1000** (perf 122). SDK conformance runner: **120/120 checks**.
 
-## Run it
-
-```sh
-node --experimental-strip-types main.ts
-```
-
-## Run it
-
-```sh
-node --experimental-strip-types main.ts
-```
+## Run it (on the platform)
 
 The platform runs `node /bot/main.ts` on Node 22.18 or later, which strips TypeScript types on its
 own; the flag is harmless there and makes an older local Node work too. There is nothing to install:

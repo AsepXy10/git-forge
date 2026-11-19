@@ -367,7 +367,29 @@ function collectReachableBounded(repo: Repo, roots: Iterable<string>, stopAt: Se
   return seen;
 }
 interface FetchSelection { send: Set<string>; shallow: Set<string>; unshallow: Set<string> }
-function selectFetch(repo: Repo, wantedTips: string[], haves: string[], opts: { depth?: number | null; deepenSince?: number | null; deepenNot?: string[]; shallowBoundaries?: string[] }): FetchSelection {
+function selectFetch(repo: Repo, wantedTips: string[], haves: string[], opts: { depth?: number | null; deepenSince?: number | null; deepenNot?: string[]; shallowBoundaries?: string[]; deepenRelative?: boolean }): FetchSelection {
+  // deepen-relative (real git's `fetch --deepen` in a shallow repo): the
+  // depth is relative to the client's current shallow boundaries, whose
+  // own depth is their distance from the wanted tip plus one generation.
+  let depth = opts.depth ?? null;
+  if (opts.deepenRelative && depth != null && (opts.shallowBoundaries?.length ?? 0) > 0) {
+    let extra = 1;
+    for (const b of opts.shallowBoundaries!) {
+      const seen = new Map<string, number>();
+      const q: { oid: string; d: number }[] = wantedTips.map((w) => ({ oid: w, d: 0 }));
+      while (q.length) {
+        const cur = q.shift()!;
+        if (seen.has(cur.oid)) continue;
+        seen.set(cur.oid, cur.d);
+        if (cur.oid === b) break;
+        const o = repo.objects.get(cur.oid);
+        if (o?.type === 'commit') for (const p of parseCommit(o.data).parents) q.push({ oid: p, d: cur.d + 1 });
+      }
+      const d = seen.get(b);
+      if (d != null) extra = Math.max(extra, d + 1);
+    }
+    depth = depth + extra;
+  }
   const haveSet = collectReachableBounded(repo, haves, new Set(opts.shallowBoundaries ?? []));
   const included = new Set<string>();
   const includedCommits = new Set<string>();
@@ -395,7 +417,7 @@ function selectFetch(repo: Repo, wantedTips: string[], haves: string[], opts: { 
     const c = parseCommit(obj.data);
     included.add(oid);
     addTreeObjects(repo, c.tree, included);
-    if (opts.depth != null && d >= opts.depth - 1) continue;
+    if (depth != null && d >= depth - 1) continue;
     for (const p of c.parents) {
       if (excludedCommits.has(p)) continue;
       if (opts.deepenSince != null) {
@@ -953,7 +975,7 @@ function handleInfoRefs(repo: Repo, service: string, req: IncomingMessage, res: 
       sendRaw(res, 200, 'application/x-git-upload-pack-advertisement', Buffer.concat(lines));
       return;
     }
-    const caps = 'multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not no-progress include-tag multi_ack_detailed allow-tip-sha1-in-want symref=HEAD:refs/heads/main agent=git/2.43.0';
+    const caps = 'multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative no-progress include-tag multi_ack_detailed allow-tip-sha1-in-want symref=HEAD:refs/heads/main agent=git/2.43.0';
     const parts: Buffer[] = [];
     parts.push(pkt(`# service=git-upload-pack\n`));
     parts.push(FLUSH);
@@ -1010,7 +1032,7 @@ function handleUploadPack(repo: Repo, req: IncomingMessage, res: ServerResponse,
   let command = '';
   const wants: string[] = []; const haves: string[] = [];
   const shallowWants: string[] = [];
-  let deepen: number | null = null; let deepenSince: number | null = null; let deepenNot: string[] = [];
+  let deepen: number | null = null; let deepenSince: number | null = null; let deepenNot: string[] = []; let deepenRelative = false;
   let refPrefix: string[] = []; let refPeel = false; let refSymrefs = false; let refUnborn = false; let filter = false;
   let inArgs = false;
   for (const line of lines) {
@@ -1031,6 +1053,7 @@ function handleUploadPack(repo: Repo, req: IncomingMessage, res: ServerResponse,
       else if (s.startsWith('have ')) haves.push(s.slice(5, 45));
       else if (s.startsWith('shallow ')) shallowWants.push(s.slice(8, 48));
       else if (s.startsWith('deepen ')) deepen = parseInt(s.slice(7).trim(), 10);
+      else if (s.trim() === 'deepen-relative') deepenRelative = true;
       else if (s.startsWith('deepen-since ')) deepenSince = parseInt(s.slice('deepen-since '.length).trim(), 10);
       else if (s.startsWith('deepen-not ')) deepenNot.push(s.slice('deepen-not '.length).trim());
       else if (s.startsWith('filter ')) filter = true;
@@ -1039,9 +1062,10 @@ function handleUploadPack(repo: Repo, req: IncomingMessage, res: ServerResponse,
   if (command === 'ls-refs') {
     const out: Buffer[] = [];
     const refs = advertisedRefs(repo, true);
-    // HEAD with its symref-target attribute on one line, only when no ref-prefix
-    // filters the reply (a prefix reply must contain only matching refs).
-    if (refSymrefs && !refPrefix.length) {
+    // HEAD with its symref-target attribute on one line. A clone asks for
+    // ref-prefix HEAD explicitly, so omitting it there leaves git unable
+    // to work out the remote HEAD and the checkout comes back empty.
+    if (refSymrefs && (!refPrefix.length || refPrefix.includes('HEAD'))) {
       const headOid = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
       if (headOid) out.push(pkt(`${headOid} HEAD symref-target:refs/heads/${repo.defaultBranch}\n`));
     }
@@ -1062,84 +1086,158 @@ function handleUploadPack(repo: Repo, req: IncomingMessage, res: ServerResponse,
     // resolve wanted tips
     const wantedTips: string[] = [];
     for (const w of wants) if (repo.objects.has(w)) wantedTips.push(w);
-    const selection = selectFetch(repo, wantedTips, haves, { depth: deepen, deepenSince, deepenNot, shallowBoundaries: shallowWants });
+    const selection = selectFetch(repo, wantedTips, haves, { depth: deepen, deepenSince, deepenNot, shallowBoundaries: shallowWants, deepenRelative });
     const toSend = selection.send;
     const shallowSet = selection.shallow;
     const unshallowSet = selection.unshallow;
     void filter;
     // Build sections
     const parts: Buffer[] = [];
-    // acknowledgments
-    parts.push(pkt('acknowledgments\n'));
-    const haveSet = collectReachableBounded(repo, haves, new Set(shallowWants));
-    const allHave = wants.length > 0 && wants.every((w) => haveSet.has(w));
-    if (haves.length === 0) parts.push(pkt('NAK\n'));
-    else if (allHave) { parts.push(pkt('ready\n')); for (const h of haves) if (repo.objects.has(h)) parts.push(pkt(`ACK ${h}\n`)); }
-    else parts.push(pkt('NAK\n'));
-    parts.push(DELIM);
-    // shallow-info
-    parts.push(pkt('shallow-info\n'));
-    for (const s of [...shallowSet].sort()) parts.push(pkt(`shallow ${s}\n`));
-    for (const s of [...unshallowSet].sort()) parts.push(pkt(`unshallow ${s}\n`));
-    parts.push(DELIM);
-    // wanted-refs
-    parts.push(pkt('wanted-refs\n'));
-    for (const tip of wantedTips) {
-      for (const [ref, oid] of repo.refs) if (oid === tip) parts.push(pkt(`${tip} ${ref}\n`));
+    // Protocol v2: a client that sent no 'have' lines (e.g. a fresh clone)
+    // goes straight to the packfile section and rejects an
+    // acknowledgments section, so only send acknowledgments /
+    // wanted-refs when haves were actually sent. A shallow request
+    // (deepen) with no haves still needs its shallow-info section,
+    // or the clone comes back unshallowed.
+    const wantShallow = deepen !== null || deepenSince !== null || deepenNot.length > 0 || shallowWants.length > 0;
+    if (haves.length > 0) {
+      // acknowledgments. 'ready' means the server knows the client's
+      // haves and can send the pack now; NAK means it lacks a have.
+      // After a NAK (no 'ready') git expects the packfile section next
+      // and rejects any shallow-info / wanted-refs section in between.
+      parts.push(pkt('acknowledgments\n'));
+      const serverHasHaves = haves.every((h) => repo.objects.has(h));
+      if (serverHasHaves) {
+        parts.push(pkt('ready\n'));
+        for (const h of haves) parts.push(pkt(`ACK ${h}\n`));
+        parts.push(DELIM);
+        // shallow-info
+        parts.push(pkt('shallow-info\n'));
+        for (const s of [...shallowSet].sort()) parts.push(pkt(`shallow ${s}\n`));
+        for (const s of [...unshallowSet].sort()) parts.push(pkt(`unshallow ${s}\n`));
+        parts.push(DELIM);
+        // wanted-refs
+        parts.push(pkt('wanted-refs\n'));
+        for (const tip of wantedTips) {
+          for (const [ref, oid] of repo.refs) if (oid === tip) parts.push(pkt(`${tip} ${ref}\n`));
+        }
+        parts.push(DELIM);
+      } else {
+        parts.push(pkt('NAK\n'));
+        parts.push(DELIM);
+      }
+    } else if (wantShallow) {
+      parts.push(pkt('shallow-info\n'));
+      for (const s of [...shallowSet].sort()) parts.push(pkt(`shallow ${s}\n`));
+      for (const s of [...unshallowSet].sort()) parts.push(pkt(`unshallow ${s}\n`));
+      parts.push(DELIM);
     }
-    parts.push(DELIM);
-    // packfile — emitted only when there are objects to send; an empty
-    // packfile section is a protocol error for the client.
+    // packfile — emitted when there are objects to send, and also when
+    // a shallow/deepen was requested: the client expects a packfile
+    // section then even if the selection came up empty, and an empty
+    // pack (PACK, 0 objects, trailer) is its answer. A plain no-op
+    // fetch with nothing new omits the section, as before.
     const objs: GitObject[] = [];
     if (toSend.size) for (const oid of [...toSend].sort()) { const o = repo.objects.get(oid); if (o) objs.push(o); }
-    if (objs.length) {
+    if (objs.length || wantShallow) {
       parts.push(pkt('packfile\n'));
       const pack = cachedPack(repo, objs, packCacheKey(repo, wants, haves, deepen, deepenSince, deepenNot, shallowWants));
       for (const b of sideband(pack)) parts.push(b);
     }
+    parts.push(FLUSH);
     sendRaw(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(parts));
     return;
   }
   sendRaw(res, 200, 'application/x-git-upload-pack-result', Buffer.alloc(0));
 }
 function handleUploadPackV0(repo: Repo, res: ServerResponse, body: Buffer): void {
-  const lines = body.toString('utf8').split('\n');
+  // Real git sends the v0 request as pkt-lines ('009c' + 'want ...\n',
+  // flush, 'have ...', 'done'); the old split-on-newline parser never
+  // saw a line starting with 'want ', so it always sent an empty pack.
+  // Accept pkt-lines, falling back to plain lines for the harness client.
+  const rawLines: string[] = [];
+  let pktParsed = false;
+  try {
+    const decoded = decodePktLines(body);
+    if (decoded.length) { pktParsed = true; for (const l of decoded) if (l.kind === 'data' && l.payload) rawLines.push(l.payload.toString('utf8')); else if (l.kind === 'flush') rawLines.push(''); }
+  } catch { pktParsed = false; }
+  const lines = pktParsed ? rawLines : body.toString('utf8').split('\n');
   const wants: string[] = []; const haves: string[] = [];
   const shallowWants: string[] = [];
-  let deepen: number | null = null; let deepenSince: number | null = null; let deepenNot: string[] = [];
-  let section = 0;
+  let deepen: number | null = null; let deepenSince: number | null = null; let deepenNot: string[] = []; let deepenRelative = false; let hasDone = false;
+  // Real git's v0 request puts `deepen` after the first flush, in the
+  // negotiation section, not with the wants — so parse every line type
+  // in every section instead of assuming a section layout.
   for (const line of lines) {
     const s = line.trim();
-    if (s === '') { section += 1; continue; }
-    if (section === 0) {
-      if (s.startsWith('want ')) wants.push(s.slice(5, 45));
-      else if (s.startsWith('shallow ')) shallowWants.push(s.slice(8, 48));
-      else if (s.startsWith('deepen ')) deepen = parseInt(s.slice(7).trim(), 10);
-      else if (s.startsWith('deepen-since ')) deepenSince = parseInt(s.slice('deepen-since '.length).trim(), 10);
-      else if (s.startsWith('deepen-not ')) deepenNot.push(s.slice('deepen-not '.length).trim());
-    } else {
-      if (s.startsWith('have ')) haves.push(s.slice(5, 45));
+    if (s === '') continue;
+    if (s.startsWith('want ')) {
+      wants.push(s.slice(5, 45));
+      // v0 negotiates deepen-relative as a capability on the want line,
+      // not as its own argument (real git sends it there; the harness
+      // client does not, and its deepen is absolute).
+      if (s.includes(' deepen-relative')) deepenRelative = true;
     }
+    else if (s.startsWith('shallow ')) shallowWants.push(s.slice(8, 48));
+    else if (s.startsWith('deepen ')) deepen = parseInt(s.slice(7).trim(), 10);
+    else if (s.trim() === 'deepen-relative') deepenRelative = true;
+    else if (s.startsWith('deepen-since ')) deepenSince = parseInt(s.slice('deepen-since '.length).trim(), 10);
+    else if (s.startsWith('deepen-not ')) deepenNot.push(s.slice('deepen-not '.length).trim());
+    else if (s.startsWith('have ')) haves.push(s.slice(5, 45));
+    else if (s === 'done') hasDone = true;
   }
   void shallowWants;
   const wantedTips = wants.filter((w) => repo.objects.has(w));
-  const selection = selectFetch(repo, wantedTips, haves, { depth: deepen, deepenSince, deepenNot, shallowBoundaries: shallowWants });
+  const selection = selectFetch(repo, wantedTips, haves, { depth: deepen, deepenSince, deepenNot, shallowBoundaries: shallowWants, deepenRelative });
   const toSend = selection.send;
   const shallowSet = selection.shallow;
   const textLines: Buffer[] = [];
   const haveSet = collectReachableBounded(repo, haves, new Set(shallowWants));
   const allHave = wants.length > 0 && wants.every((w) => haveSet.has(w));
-  if (haves.length === 0) textLines.push(pkt(Buffer.concat([Buffer.from([2]), Buffer.from('NAK\n')])));
-  else if (allHave) textLines.push(pkt(Buffer.concat([Buffer.from([2]), Buffer.from('ready\n')])));
-  else textLines.push(pkt(Buffer.concat([Buffer.from([2]), Buffer.from('NAK\n')])));
-  for (const s of [...shallowSet].sort()) textLines.push(pkt(Buffer.concat([Buffer.from([2]), Buffer.from(`shallow ${s}\n`)])));
-  for (const s of [...selection.unshallow].sort()) textLines.push(pkt(Buffer.concat([Buffer.from([2]), Buffer.from(`unshallow ${s}\n`)])));
+  // v0: ACK/NAK and shallow lines are plain pkt-lines; only the
+  // packfile itself is sidebanded (band 1). Wrapping NAK in band 2 made
+  // git 2.43 read it as '?NAK'. Canonical order (git upload-pack):
+  // the shallow/unshallow lines come FIRST, terminated by a flush,
+  // and only then the NAK/ACK lines and the packfile — real git reads
+  // the shallow section before the acks and dies with
+  // "expected shallow/unshallow, got NAK" when NAK comes first.
+  const shallowRequested = deepen !== null || deepenSince !== null || deepenNot.length > 0 || shallowWants.length > 0;
+  if (shallowRequested || shallowSet.size > 0 || selection.unshallow.size > 0) {
+    for (const s of [...shallowSet].sort()) textLines.push(pkt(`shallow ${s}\n`));
+    for (const s of [...selection.unshallow].sort()) textLines.push(pkt(`unshallow ${s}\n`));
+    textLines.push(FLUSH);
+  }
+  // Stateless v0 (smart HTTP): the client's wants phase carries no
+  // 'done', and its shallow phase reads ONLY the shallow list from
+  // that response — a NAK/pack after the flush makes it die with
+  // "expected shallow list". So answer that phase with the shallow
+  // list alone; the follow-up request carries 'done' and gets the
+  // full shallow + ack + packfile response below.
+  if (shallowRequested && !hasDone) {
+    sendRaw(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(textLines));
+    return;
+  }
+  if (haves.length === 0) textLines.push(pkt('NAK\n'));
+  else if (allHave) {
+    // multi_ack_detailed (the form real git 2.43 sends and expects):
+    // one 'ACK <oid> common' per have, then a final bare 'ACK <last>'
+    // that closes the ack phase. Bare ACKs alone make the client end
+    // the ack phase after the first one, so a second have's ACK is
+    // then read as pack data ("bad band #65").
+    const acked = haves.filter((h) => repo.objects.has(h));
+    for (const h of acked) textLines.push(pkt(`ACK ${h} common\n`));
+    if (acked.length) textLines.push(pkt(`ACK ${acked[acked.length - 1]}\n`));
+  }
+  else textLines.push(pkt('NAK\n'));
   const objs: GitObject[] = [];
   if (toSend.size) for (const oid of [...toSend].sort()) { const o = repo.objects.get(oid); if (o) objs.push(o); }
-  if (objs.length) {
+  // As in v2: a shallow/deepen request expects a packfile even when the
+  // selection is empty, answered with an empty pack.
+  if (objs.length || shallowRequested) {
     const pack = cachedPack(repo, objs, packCacheKey(repo, wants, haves, deepen, deepenSince, deepenNot, shallowWants));
     for (const b of sideband(pack)) textLines.push(b);
   }
+  textLines.push(FLUSH);
   sendRaw(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(textLines));
 }
 function handleReceivePack(repo: Repo, res: ServerResponse, body: Buffer): void {
@@ -1228,6 +1326,9 @@ function sendReceiveReport(res: ServerResponse, results: { ref: string; ok: bool
   for (let i = 0; i < stream.length; i += 60000) {
     out.push(pkt(Buffer.concat([Buffer.from([1]), stream.subarray(i, i + 60000)])));
   }
+  // The sideband demultiplexer only ends on a top-level flush pkt-line;
+  // without it git reports 'unexpected disconnect while reading sideband'.
+  out.push(FLUSH);
   sendRaw(res, 200, 'application/x-git-receive-pack-result', Buffer.concat(out));
 }
 async function handleGit(req: IncomingMessage, res: ServerResponse, path: string, method: string): Promise<boolean> {
